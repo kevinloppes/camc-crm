@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Dados gerados ao executar o sistema (banco de exemplo e backups)
+dados/*.db
+dados/*.db-journal
+dados/backups/
+
+# Editores e sistema
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
