@@ -8,9 +8,11 @@ Rastreabilidade: cadeia "da colmeia/planta à mesa" por lote, com balanço de ma
 """
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from . import banco, seguranca
 from .seguranca import PermissaoNegada, Sessao
@@ -88,6 +90,9 @@ def validar_email(texto) -> bool:
     return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", texto or ""))
 
 
+normalizar_email = banco.normalizar_email
+
+
 def formatar_documento(texto) -> str:
     d = somente_digitos(texto)
     if len(d) == 11:
@@ -158,11 +163,32 @@ class ServicoCRM:
     def _autor(self) -> str:
         return self.sessao.nome if self.sessao else "Sistema"
 
+    def _perfil_ativo(self) -> str | None:
+        if self.sessao is None:
+            return None
+        return seguranca.obter_perfil_sessao_ativa(self.con, self.sessao)
+
+    def _exigir_sessao(self) -> Sessao:
+        if self._perfil_ativo() is None:
+            raise seguranca.SessaoInvalida("Sessão expirada ou revogada. Faça login novamente.")
+        return self.sessao
+
     def pode(self, permissao: str) -> bool:
-        return bool(self.sessao and self.sessao.pode(permissao))
+        perfil = self._perfil_ativo()
+        return bool(perfil and seguranca.tem_permissao(perfil, permissao))
 
     def _exigir(self, permissao: str) -> None:
-        if not self.pode(permissao):
+        perfil = self._perfil_ativo()
+        if perfil is None:
+            raise seguranca.SessaoInvalida("Sessão expirada ou revogada. Faça login novamente.")
+        if not seguranca.tem_permissao(perfil, permissao):
+            raise PermissaoNegada("Seu perfil não tem permissão para esta ação.")
+
+    def _exigir_alguma(self, *permissoes: str) -> None:
+        perfil = self._perfil_ativo()
+        if perfil is None:
+            raise seguranca.SessaoInvalida("Sessão expirada ou revogada. Faça login novamente.")
+        if not any(seguranca.tem_permissao(perfil, p) for p in permissoes):
             raise PermissaoNegada("Seu perfil não tem permissão para esta ação.")
 
     def _auditar(self, acao: str, detalhe: str, quem: str | None = None) -> None:
@@ -184,11 +210,15 @@ class ServicoCRM:
             saida.append(c)
         return saida
 
-    def obter_cliente(self, cliente_id: int):
+    def _obter_cliente_interno(self, cliente_id: int):
         c = self.con.execute("SELECT * FROM clientes WHERE id = ?", (cliente_id,)).fetchone()
         if c is None:
             raise ErroValidacao("Cliente não encontrado.")
         return c
+
+    def obter_cliente(self, cliente_id: int):
+        self._exigir("clientes.ver")
+        return self._obter_cliente_interno(cliente_id)
 
     def _normalizar_cliente(self, dados: dict, ignorar_id: int | None = None) -> dict:
         d = {k: (dados.get(k) or "").strip() for k in
@@ -204,8 +234,14 @@ class ServicoCRM:
             raise ErroValidacao("CNPJ inválido. Confira os números.")
         if not d["telefone"] and not d["email"]:
             raise ErroValidacao("Informe ao menos um telefone ou e-mail.")
-        if d["email"] and not validar_email(d["email"]):
-            raise ErroValidacao("E-mail inválido.")
+        email_norm = ""
+        if d["email"]:
+            if not validar_email(d["email"]):
+                raise ErroValidacao("E-mail inválido.")
+            email_norm = normalizar_email(d["email"])
+            if not email_norm:
+                raise ErroValidacao("E-mail inválido.")
+        d["email_normalizado"] = email_norm
         if d["canal_preferido"] not in CANAIS:
             raise ErroValidacao("Escolha o canal preferido.")
         if d["segmento"] not in SEGMENTOS:
@@ -214,7 +250,8 @@ class ServicoCRM:
             if c["id"] == ignorar_id:
                 continue
             mesmo_tel = len(somente_digitos(d["telefone"])) >= 8 and somente_digitos(c["telefone"]) == somente_digitos(d["telefone"])
-            mesmo_email = d["email"] and c["email"].lower() == d["email"].lower()
+            c_email_norm = c["email_normalizado"] or normalizar_email(c["email"])
+            mesmo_email = bool(email_norm) and c_email_norm == email_norm
             if c["documento"] == d["documento"] or mesmo_tel or mesmo_email:
                 raise ClienteDuplicado(c)
         return d
@@ -224,48 +261,76 @@ class ServicoCRM:
         if not consentimento:
             raise ErroValidacao("Registre o consentimento do cliente (LGPD) para concluir o cadastro.")
         d = self._normalizar_cliente(dados)
-        with self.con:
-            cur = self.con.execute(
-                "INSERT INTO clientes (nome, tipo, documento, telefone, email, cidade, canal_preferido, segmento,"
-                " consentimento_em, criado_em) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (d["nome"], d["tipo"], d["documento"], d["telefone"], d["email"], d["cidade"],
-                 d["canal_preferido"], d["segmento"], banco.agora(), banco.agora()))
-            self._auditar("Cliente cadastrado", f"{d['nome']} cadastrado com consentimento LGPD.")
+        try:
+            with self.con:
+                cur = self.con.execute(
+                    "INSERT INTO clientes (nome, tipo, documento, telefone, email, email_normalizado, cidade,"
+                    " canal_preferido, segmento, consentimento_em, criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (d["nome"], d["tipo"], d["documento"], d["telefone"], d["email"], d["email_normalizado"], d["cidade"],
+                     d["canal_preferido"], d["segmento"], banco.agora(), banco.agora()))
+                self._auditar("Cliente cadastrado", f"{d['nome']} cadastrado com consentimento LGPD.")
+        except sqlite3.IntegrityError:
+            raise ErroValidacao("Não foi possível cadastrar o cliente: documento ou e-mail já utilizado.")
         return cur.lastrowid
 
     def editar_cliente(self, cliente_id: int, dados: dict) -> None:
         self._exigir("clientes.editar")
-        atual = self.obter_cliente(cliente_id)
+        atual = self._obter_cliente_interno(cliente_id)
         if atual["anonimizado"]:
             raise ErroValidacao("Cliente anonimizado não pode ser editado.")
         d = self._normalizar_cliente(dados, ignorar_id=cliente_id)
-        with self.con:
-            self.con.execute(
-                "UPDATE clientes SET nome=?, tipo=?, documento=?, telefone=?, email=?, cidade=?, canal_preferido=?, segmento=? WHERE id=?",
-                (d["nome"], d["tipo"], d["documento"], d["telefone"], d["email"], d["cidade"],
-                 d["canal_preferido"], d["segmento"], cliente_id))
-            self._auditar("Cliente editado", f"Cadastro de {d['nome']} atualizado.")
+        try:
+            with self.con:
+                self.con.execute(
+                    "UPDATE clientes SET nome=?, tipo=?, documento=?, telefone=?, email=?, email_normalizado=?,"
+                    " cidade=?, canal_preferido=?, segmento=? WHERE id=?",
+                    (d["nome"], d["tipo"], d["documento"], d["telefone"], d["email"], d["email_normalizado"],
+                     d["cidade"], d["canal_preferido"], d["segmento"], cliente_id))
+                self._auditar("Cliente editado", f"Cadastro de {d['nome']} atualizado.")
+        except sqlite3.IntegrityError:
+            raise ErroValidacao("Não foi possível atualizar o cliente: documento ou e-mail já utilizado.")
 
     def anonimizar_cliente(self, cliente_id: int) -> None:
-        """Direito do titular (LGPD): remove os dados pessoais e mantém o histórico sem identificar a pessoa."""
+        """Direito do titular (LGPD): remove os dados pessoais e mensagens privadas, mantendo histórico estatístico sem identificar a pessoa."""
         self._exigir("clientes.anonimizar")
-        c = self.obter_cliente(cliente_id)
+        c = self._obter_cliente_interno(cliente_id)
+        if c["anonimizado"]:
+            raise ErroValidacao("Este cliente já foi anonimizado.")
+        rotulo_anon = f"Cliente anonimizado #{cliente_id}"
         with self.con:
             self.con.execute(
-                "UPDATE clientes SET nome=?, documento='', telefone='', email='', cidade='', consentimento_em=NULL, anonimizado=1 WHERE id=?",
-                (f"Cliente anonimizado #{cliente_id}", cliente_id))
+                "UPDATE clientes SET nome=?, documento='', telefone='', email='', email_normalizado='',"
+                " cidade='', consentimento_em=NULL, anonimizado=1 WHERE id=?",
+                (rotulo_anon, cliente_id))
             self.con.execute("DELETE FROM anotacoes WHERE cliente_id = ?", (cliente_id,))
-            self._auditar("Anonimização (LGPD)", f"Dados pessoais de {c['nome']} anonimizados.")
+            self.con.execute("DELETE FROM interacoes WHERE cliente_id = ?", (cliente_id,))
+            self.con.execute(
+                "UPDATE ticket_eventos SET autor = ? WHERE tipo = 'cliente' AND ticket_id IN "
+                "(SELECT id FROM tickets WHERE cliente_id = ?)",
+                (rotulo_anon, cliente_id))
+            self._auditar("Anonimização (LGPD)", f"Dados pessoais do cliente #{cliente_id} anonimizados.")
 
     def adicionar_anotacao(self, cliente_id: int, texto: str) -> None:
         self._exigir("clientes.anotar")
         if not texto.strip():
             raise ErroValidacao("Escreva a anotação antes de salvar.")
-        c = self.obter_cliente(cliente_id)
+        c = self._obter_cliente_interno(cliente_id)
+        if c["anonimizado"]:
+            raise ErroValidacao("Cliente anonimizado não pode receber novas anotações.")
         with self.con:
             self.con.execute("INSERT INTO anotacoes (cliente_id, autor, texto, criado_em) VALUES (?,?,?,?)",
                              (cliente_id, self._autor(), texto.strip(), banco.agora()))
             self._auditar("Anotação interna", f"{c['nome']}: anotação adicionada.")
+
+    def excluir_anotacao(self, anotacao_id: int) -> None:
+        """Exclusão real (hard delete) de anotação interna."""
+        self._exigir_alguma("clientes.editar", "clientes.anonimizar")
+        a = self.con.execute("SELECT id, cliente_id FROM anotacoes WHERE id = ?", (anotacao_id,)).fetchone()
+        if a is None:
+            raise ErroValidacao("Anotação não encontrada.")
+        with self.con:
+            self.con.execute("DELETE FROM anotacoes WHERE id = ?", (anotacao_id,))
+            self._auditar("Anotação excluída", f"Anotação #{anotacao_id} do cliente #{a['cliente_id']} excluída definitivamente.")
 
     def anotacoes(self, cliente_id: int):
         self._exigir("clientes.ver")
@@ -278,7 +343,9 @@ class ServicoCRM:
             raise ErroValidacao("Escolha o canal da interação.")
         if not texto.strip():
             raise ErroValidacao("Descreva a interação.")
-        c = self.obter_cliente(cliente_id)
+        c = self._obter_cliente_interno(cliente_id)
+        if c["anonimizado"]:
+            raise ErroValidacao("Cliente anonimizado não pode receber novos contatos.")
         with self.con:
             self.con.execute("INSERT INTO interacoes (cliente_id, canal, texto, criado_em) VALUES (?,?,?,?)",
                              (cliente_id, canal, texto.strip(), banco.agora()))
@@ -292,7 +359,7 @@ class ServicoCRM:
             eventos.append({"quando": i["criado_em"], "origem": i["canal"], "texto": i["texto"]})
         for p in self.con.execute("SELECT * FROM pedidos WHERE cliente_id = ?", (cliente_id,)):
             eventos.append({"quando": p["criado_em"], "origem": "Pedido",
-                            "texto": f"P-{p['id']}: {self.descricao_pedido(p['id'])} ({moeda(self.valor_pedido(p['id']))})"})
+                            "texto": f"P-{p['id']}: {self._descricao_pedido(p['id'])} ({moeda(self._valor_pedido(p['id']))})"})
             if p["entregue_em"]:
                 eventos.append({"quando": p["entregue_em"], "origem": "Entrega", "texto": f"P-{p['id']} entregue."})
         for t in self.con.execute("SELECT * FROM tickets WHERE cliente_id = ?", (cliente_id,)):
@@ -305,27 +372,39 @@ class ServicoCRM:
         return sorted(eventos, key=lambda e: e["quando"], reverse=True)
 
     # ---- pedidos
-    def descricao_pedido(self, pedido_id: int) -> str:
+    def _descricao_pedido(self, pedido_id: int) -> str:
         itens = self.con.execute(
             "SELECT i.quantidade, p.nome FROM pedido_itens i JOIN produtos p ON p.id = i.produto_id WHERE i.pedido_id = ?",
             (pedido_id,)).fetchall()
         return ", ".join(f"{i['quantidade']}× {i['nome']}" for i in itens)
 
-    def valor_pedido(self, pedido_id: int) -> float:
+    def _valor_pedido(self, pedido_id: int) -> float:
         return self.con.execute("SELECT COALESCE(SUM(quantidade * preco_unitario), 0) FROM pedido_itens WHERE pedido_id = ?",
                                 (pedido_id,)).fetchone()[0]
 
-    def lote_do_pedido(self, pedido_id: int) -> str | None:
+    def _lote_do_pedido(self, pedido_id: int) -> str | None:
         r = self.con.execute("SELECT lote FROM pedido_itens WHERE pedido_id = ? ORDER BY id LIMIT 1", (pedido_id,)).fetchone()
         return r["lote"] if r else None
+
+    def descricao_pedido(self, pedido_id: int) -> str:
+        self._exigir_alguma("clientes.ver", "rastreio.ver", "tickets.ver", "feedback.simular")
+        return self._descricao_pedido(pedido_id)
+
+    def valor_pedido(self, pedido_id: int) -> float:
+        self._exigir_alguma("clientes.ver", "rastreio.ver", "tickets.ver", "feedback.simular")
+        return self._valor_pedido(pedido_id)
+
+    def lote_do_pedido(self, pedido_id: int) -> str | None:
+        self._exigir_alguma("clientes.ver", "rastreio.ver", "tickets.ver", "feedback.simular")
+        return self._lote_do_pedido(pedido_id)
 
     def pedidos_do_cliente(self, cliente_id: int) -> list[dict]:
         self._exigir("clientes.ver")
         saida = []
         for p in self.con.execute("SELECT * FROM pedidos WHERE cliente_id = ? ORDER BY criado_em DESC", (cliente_id,)):
             saida.append({"id": p["id"], "codigo": f"P-{p['id']}", "criado_em": p["criado_em"],
-                          "itens": self.descricao_pedido(p["id"]), "valor": self.valor_pedido(p["id"]),
-                          "lote": self.lote_do_pedido(p["id"]), "status": ESTADOS_PEDIDO[p["status"]]})
+                          "itens": self._descricao_pedido(p["id"]), "valor": self._valor_pedido(p["id"]),
+                          "lote": self._lote_do_pedido(p["id"]), "status": ESTADOS_PEDIDO[p["status"]]})
         return saida
 
     # ---- tickets
@@ -374,21 +453,19 @@ class ServicoCRM:
             saida.append(t)
         return saida
 
-    def criar_ticket(self, cliente_id: int, canal: str, categoria: str, prioridade: str, assunto: str,
-                     descricao: str = "", pedido_id: int | None = None, automatico: bool = False) -> int:
-        if not automatico:
-            self._exigir("tickets.criar")
+    def _criar_ticket_interno(self, cliente_id: int, canal: str, categoria: str, prioridade: str, assunto: str,
+                              descricao: str = "", pedido_id: int | None = None, automatico: bool = False) -> int:
         if canal not in CANAIS or categoria not in CATEGORIAS or prioridade not in PRIORIDADES:
             raise ErroValidacao("Canal, categoria ou prioridade inválidos.")
         if not assunto.strip():
             raise ErroValidacao("Informe o assunto do ticket.")
-        cliente = self.obter_cliente(cliente_id)
+        cliente = self._obter_cliente_interno(cliente_id)
         lote = None
         if pedido_id:
             p = self.con.execute("SELECT * FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
             if p is None or p["cliente_id"] != cliente_id:
                 raise ErroValidacao("O pedido escolhido não pertence a este cliente.")
-            lote = self.lote_do_pedido(pedido_id)
+            lote = self._lote_do_pedido(pedido_id)
         if categoria == "Qualidade" and not pedido_id:
             raise ErroValidacao("Tickets de qualidade precisam de um pedido, para ligar a reclamação ao lote.")
         agora = banco.agora()
@@ -406,6 +483,11 @@ class ServicoCRM:
             self._auditar("Ticket aberto", f"{protocolo} aberto" + (" automaticamente (nota baixa)." if automatico else f" via {canal}."),
                           "Sistema" if automatico else None)
         return novo_id
+
+    def criar_ticket(self, cliente_id: int, canal: str, categoria: str, prioridade: str, assunto: str,
+                     descricao: str = "", pedido_id: int | None = None, automatico: bool = False) -> int:
+        self._exigir("tickets.criar")
+        return self._criar_ticket_interno(cliente_id, canal, categoria, prioridade, assunto, descricao, pedido_id, automatico=False)
 
     def _evento(self, ticket_id: int, tipo: str, autor: str, texto: str) -> None:
         self.con.execute("INSERT INTO ticket_eventos (ticket_id, tipo, autor, texto, criado_em) VALUES (?,?,?,?,?)",
@@ -470,6 +552,12 @@ class ServicoCRM:
     def escalonar(self, ticket_id: int) -> None:
         t = self.obter_ticket(ticket_id)
         self._exigir_editar(t)
+        if self._perfil_ativo() == "gestor":
+            raise ErroValidacao("Tickets já estão sob responsabilidade do gestor.")
+        if t["status"] in ("resolvido", "encerrado"):
+            raise ErroValidacao("Não é possível escalonar tickets resolvidos ou encerrados.")
+        if t["escalonado"]:
+            raise ErroValidacao("Este ticket já foi escalonado.")
         with self.con:
             self.con.execute("UPDATE tickets SET escalonado=1 WHERE id=?", (ticket_id,))
             self._evento(ticket_id, "sistema", self._autor(), "Ticket escalonado ao gestor.")
@@ -478,8 +566,9 @@ class ServicoCRM:
     # ---- rastreabilidade
     def listar_lotes(self, apenas_venda: bool = False):
         self._exigir("rastreio.ver")
-        sql = "SELECT * FROM lotes" + (" WHERE venda = 1" if apenas_venda else "") + " ORDER BY codigo"
-        return self.con.execute(sql).fetchall()
+        if apenas_venda:
+            return self.con.execute("SELECT * FROM lotes WHERE venda = 1 ORDER BY codigo").fetchall()
+        return self.con.execute("SELECT * FROM lotes ORDER BY codigo").fetchall()
 
     def _nos_do_lote(self, codigo: str, visitados: set) -> list[dict]:
         if codigo in visitados:
@@ -508,9 +597,11 @@ class ServicoCRM:
         self._exigir("rastreio.ver")
         return self._nos_do_lote(codigo, set())
 
-    def nos_do_pedido(self, pedido_id: int) -> list[dict]:
+    def _nos_do_pedido_interno(self, pedido_id: int) -> list[dict]:
         p = self.con.execute("SELECT p.*, c.nome AS cliente_nome FROM pedidos p JOIN clientes c ON c.id = p.cliente_id WHERE p.id = ?",
                              (pedido_id,)).fetchone()
+        if p is None:
+            raise ErroValidacao("Pedido não encontrado.")
         f = self.con.execute("SELECT * FROM feedbacks WHERE pedido_id = ?", (pedido_id,)).fetchone()
         if p["entregue_em"]:
             data_entrega = formatar_data(p["entregue_em"])
@@ -518,7 +609,7 @@ class ServicoCRM:
             data_entrega = ("Postado em " + formatar_data(p["postado_em"])) if p["postado_em"] else "Em separação"
         return [
             {"tipo": "pedido", "titulo": "Pedido", "subtitulo": f"P-{p['id']} – {p['cliente_nome']}", "data": formatar_data(p["criado_em"]),
-             "medidas": moeda(self.valor_pedido(pedido_id)), "alerta": "", "lote": "", "pendente": False},
+             "medidas": moeda(self._valor_pedido(pedido_id)), "alerta": "", "lote": "", "pendente": False},
             {"tipo": "entrega", "titulo": "Entrega", "subtitulo": p["transportadora"], "data": data_entrega,
              "medidas": f"Rastreio {p['rastreio']}" if p["rastreio"] else "", "alerta": "", "lote": "", "pendente": not p["entregue_em"]},
             {"tipo": "feedback", "titulo": "Avaliação", "subtitulo": f"Nota {f['nota']} de 5" if f else "Aguardando",
@@ -526,10 +617,14 @@ class ServicoCRM:
              "alerta": "", "lote": "", "pendente": f is None},
         ]
 
+    def nos_do_pedido(self, pedido_id: int) -> list[dict]:
+        self._exigir("rastreio.ver")
+        return self._nos_do_pedido_interno(pedido_id)
+
     def cadeia_do_pedido(self, pedido_id: int) -> list[dict]:
         self._exigir("rastreio.ver")
-        lote = self.lote_do_pedido(pedido_id)
-        return (self._nos_do_lote(lote, set()) if lote else []) + self.nos_do_pedido(pedido_id)
+        lote = self._lote_do_pedido(pedido_id)
+        return (self._nos_do_lote(lote, set()) if lote else []) + self._nos_do_pedido_interno(pedido_id)
 
     def resumo_lote(self, codigo: str) -> dict:
         self._exigir("rastreio.ver")
@@ -575,11 +670,13 @@ class ServicoCRM:
 
     # ---- avaliação do cliente (app)
     def pedidos_aguardando_avaliacao(self):
+        self._exigir("feedback.simular")
         return self.con.execute(
             "SELECT p.*, c.nome AS cliente_nome FROM pedidos p JOIN clientes c ON c.id = p.cliente_id "
             "WHERE p.status = 'entregue' AND NOT EXISTS (SELECT 1 FROM feedbacks f WHERE f.pedido_id = p.id) ORDER BY p.entregue_em").fetchall()
 
     def pedidos_em_rota(self):
+        self._exigir("feedback.simular")
         return self.con.execute("SELECT * FROM pedidos WHERE status = 'em_rota' ORDER BY id").fetchall()
 
     def simular_entrega(self) -> int | None:
@@ -594,18 +691,22 @@ class ServicoCRM:
         return p["id"]
 
     def registrar_feedback(self, pedido_id: int, nota: int, etiquetas=(), comentario: str = "",
-                           cliques: int | None = None, segundos: int | None = None):
+                           cliques: int | None = None, segundos: int | None = None,
+                           cliente_id: int | None = None):
         """Grava a avaliação (uma por pedido entregue). Notas 1 e 2 abrem um ticket de qualidade.
         Retorna (id_da_avaliação, id_do_ticket_ou_None)."""
-        if not isinstance(nota, int) or not 1 <= nota <= 5:
+        self._exigir("feedback.simular")
+        if isinstance(nota, bool) or not isinstance(nota, int) or not 1 <= nota <= 5:
             raise ErroValidacao("A nota deve ser de 1 a 5.")
         p = self.con.execute("SELECT * FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
         if p is None or p["status"] != "entregue":
             raise ErroValidacao("Só é possível avaliar pedidos já entregues.")
+        if cliente_id is not None and p["cliente_id"] != cliente_id:
+            raise PermissaoNegada("O pedido informado não pertence a este cliente.")
         if self.con.execute("SELECT 1 FROM feedbacks WHERE pedido_id = ?", (pedido_id,)).fetchone():
             raise ErroValidacao("Este pedido já foi avaliado.")
         etiquetas = [e for e in etiquetas if e in ETIQUETAS]
-        lote = self.lote_do_pedido(pedido_id)
+        lote = self._lote_do_pedido(pedido_id)
         ticket_id = None
         with self.con:
             cur = self.con.execute(
@@ -615,32 +716,42 @@ class ServicoCRM:
             seguranca.registrar_auditoria(self.con, "Cliente (aplicativo)", "Avaliação registrada",
                                           f"P-{pedido_id}, nota {nota}, lote {lote}.")
             if nota <= 2:
-                produto = self.con.execute("SELECT pr.nome FROM pedido_itens i JOIN produtos pr ON pr.id = i.produto_id "
-                                           "WHERE i.pedido_id = ? ORDER BY i.id LIMIT 1", (pedido_id,)).fetchone()["nome"]
-                ticket_id = self.criar_ticket(p["cliente_id"], "Aplicativo", "Qualidade", "alta", f"Avaliação {nota}: {produto}",
-                                              comentario.strip() or "Avaliação baixa sem comentário.", pedido_id, automatico=True)
+                item = self.con.execute("SELECT pr.nome FROM pedido_itens i JOIN produtos pr ON pr.id = i.produto_id "
+                                        "WHERE i.pedido_id = ? ORDER BY i.id LIMIT 1", (pedido_id,)).fetchone()
+                produto = item["nome"] if item else f"Pedido P-{pedido_id}"
+                ticket_id = self._criar_ticket_interno(
+                    p["cliente_id"], "Aplicativo", "Qualidade", "alta", f"Avaliação {nota}: {produto}",
+                    comentario.strip() or "Avaliação baixa sem comentário.", pedido_id, automatico=True)
         return cur.lastrowid, ticket_id
 
-    def solicitar_contato(self, ticket_id: int) -> None:
+    def solicitar_contato(self, ticket_id: int, cliente_id: int | None = None) -> None:
         """O cliente pediu retorno pelo aplicativo (botão “Falar com a gente”)."""
+        self._exigir("feedback.simular")
         t = self.con.execute("SELECT t.*, c.nome AS cliente_nome FROM tickets t JOIN clientes c ON c.id = t.cliente_id WHERE t.id = ?",
                              (ticket_id,)).fetchone()
         if t is None:
             raise ErroValidacao("Ticket não encontrado.")
+        if t["canal"] != "Aplicativo" or t["pedido_id"] is None:
+            raise PermissaoNegada("Solicitação de contato pelo aplicativo permitida apenas para tickets de avaliação.")
+        if cliente_id is not None and t["cliente_id"] != cliente_id:
+            raise PermissaoNegada("O ticket informado não pertence a este cliente.")
         with self.con:
             self._evento(ticket_id, "cliente", t["cliente_nome"], "Pediu contato imediato pelo aplicativo.")
             seguranca.registrar_auditoria(self.con, "Cliente (aplicativo)", "Pedido de contato", f"{t['protocolo']}: cliente pediu contato.")
 
     def contexto_pedido(self, pedido_id: int) -> dict:
         """Dados básicos do pedido para a tela de avaliação do aplicativo."""
+        self._exigir("feedback.simular")
         p = self.con.execute("SELECT p.*, c.nome AS cliente FROM pedidos p JOIN clientes c ON c.id = p.cliente_id WHERE p.id = ?",
                              (pedido_id,)).fetchone()
         if p is None:
             raise ErroValidacao("Pedido não encontrado.")
         item = self.con.execute("SELECT pr.nome, pr.curto, i.lote FROM pedido_itens i JOIN produtos pr ON pr.id = i.produto_id "
                                 "WHERE i.pedido_id = ? ORDER BY i.id LIMIT 1", (pedido_id,)).fetchone()
-        return {"id": pedido_id, "codigo": f"P-{pedido_id}", "cliente": p["cliente"], "primeiro_nome": p["cliente"].split()[0],
-                "produto": item["nome"], "curto": item["curto"], "lote": item["lote"]}
+        if item is None:
+            raise ErroValidacao("Pedido sem itens cadastrados.")
+        return {"id": pedido_id, "cliente_id": p["cliente_id"], "codigo": f"P-{pedido_id}", "cliente": p["cliente"],
+                "primeiro_nome": p["cliente"].split()[0], "produto": item["nome"], "curto": item["curto"], "lote": item["lote"]}
 
     # ---- indicadores
     def indicadores(self) -> dict:
@@ -681,12 +792,12 @@ class ServicoCRM:
         return seguranca.verificar_cadeia(self.con)
 
     def simular_adulteracao(self) -> int:
-        self._exigir("auditoria.verificar")
+        self._exigir("auditoria.simular")
         n = seguranca.simular_adulteracao(self.con)
         return n
 
     def desfazer_adulteracao(self) -> bool:
-        self._exigir("auditoria.verificar")
+        self._exigir("auditoria.simular")
         return seguranca.desfazer_adulteracao(self.con)
 
     # ---- administração (backup e usuários)
@@ -703,7 +814,15 @@ class ServicoCRM:
 
     def testar_backup(self, caminho):
         self._exigir("backup.testar")
-        rel = seguranca.testar_backup(caminho)
+        base = Path(banco.PASTA_BACKUPS).resolve()
+        alvo = Path(caminho).resolve()
+        try:
+            dentro = os.path.commonpath([str(base), str(alvo)]) == str(base)
+        except ValueError:
+            dentro = False
+        if not dentro or alvo == base or alvo.suffix.lower() != ".db":
+            raise ErroValidacao("Caminho de backup inválido.")
+        rel = seguranca.testar_backup(alvo)
         with self.con:
             self._auditar("Teste de restauração", f"{rel['arquivo']}: {'aprovado' if rel['aprovado'] else 'REPROVADO'}.")
         return rel
@@ -722,19 +841,26 @@ class ServicoCRM:
         novo = 0 if u["ativo"] else 1
         with self.con:
             self.con.execute("UPDATE usuarios SET ativo=?, tentativas=0, bloqueado_ate=NULL WHERE id=?", (novo, usuario_id))
+            seguranca.limpar_rate_limit_login(self.con, u["login"])
+            if novo == 0:
+                seguranca.revogar_todas_sessoes_usuario(self.con, usuario_id)
             self._auditar("Usuário " + ("ativado" if novo else "desativado"), f"{u['nome']} ({u['login']}).")
         return bool(novo)
 
     def alterar_minha_senha(self, atual: str, nova: str) -> None:
-        if self.sessao is None:
-            raise PermissaoNegada("Faça login para alterar a senha.")
-        u = self.con.execute("SELECT * FROM usuarios WHERE id = ?", (self.sessao.usuario_id,)).fetchone()
+        sessao = self._exigir_sessao()
+        u = self.con.execute("SELECT * FROM usuarios WHERE id = ?", (sessao.usuario_id,)).fetchone()
+        if u is None or not u["ativo"]:
+            raise seguranca.SessaoInvalida("Sessão expirada ou revogada. Faça login novamente.")
         if not seguranca.verificar_senha(atual, u["senha_hash"], u["salt"], u["iteracoes"]):
             raise ErroValidacao("A senha atual está incorreta.")
-        erro = seguranca.validar_forca_senha(nova)
+        if atual == nova:
+            raise ErroValidacao("A nova senha deve ser diferente da senha atual.")
+        erro = seguranca.validar_forca_senha(nova, login=u["login"])
         if erro:
             raise ErroValidacao(erro)
         h, sal, it = seguranca.hash_senha(nova)
         with self.con:
             self.con.execute("UPDATE usuarios SET senha_hash=?, salt=?, iteracoes=? WHERE id=?", (h, sal, it, u["id"]))
-            self._auditar("Senha alterada", "O usuário trocou a própria senha.")
+            seguranca.revogar_todas_sessoes_usuario(self.con, u["id"])
+            self._auditar("Senha alterada", "O usuário trocou a própria senha e todas as sessões ativas foram revogadas.")

@@ -6,6 +6,7 @@ simulação do aplicativo do cliente (avaliação em até 3 cliques).
 """
 from __future__ import annotations
 
+import os
 import time
 import tkinter as tk
 from tkinter import font as tkfont
@@ -441,15 +442,15 @@ class DialogoEtapa(Dialogo):
 
 
 class DialogoSenha(Dialogo):
-    def __init__(self, mestre, srv: ServicoCRM):
+    def __init__(self, mestre, srv: ServicoCRM, ao_alterar=None):
         super().__init__(mestre, "Trocar minha senha")
-        self.srv = srv
+        self.srv, self.ao_alterar = srv, ao_alterar
         self.atual, self.nova, self.conf = tk.StringVar(), tk.StringVar(), tk.StringVar()
         self.campo(0, "Senha atual", ttk.Entry(self.corpo, textvariable=self.atual, show="•", width=30))
         self.campo(1, "Nova senha", ttk.Entry(self.corpo, textvariable=self.nova, show="•"))
         self.campo(2, "Repita a nova senha", ttk.Entry(self.corpo, textvariable=self.conf, show="•"))
-        ttk.Label(self.corpo, text="Mínimo de 12 caracteres, combinando letras e números.", style="Suave.TLabel").grid(
-            row=3, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.corpo, text="Mínimo de 12 caracteres, ao menos 3 tipos (maiúsculas, minúsculas,\nnúmeros, símbolos) e não constar em bases de senhas vazadas.",
+                  style="Suave.TLabel", justify="left").grid(row=3, column=0, columnspan=2, sticky="w")
         self.rodape(4, "Salvar senha", self.salvar)
         self.mostrar()
 
@@ -459,11 +460,14 @@ class DialogoSenha(Dialogo):
             return
         try:
             self.srv.alterar_minha_senha(self.atual.get(), self.nova.get())
-        except (ErroValidacao, seguranca.PermissaoNegada) as e:
+        except (ErroValidacao, seguranca.PermissaoNegada, seguranca.ErroAutenticacao) as e:
             self.erro.set(str(e))
             return
+        pai = self.master
         self.destroy()
-        messagebox.showinfo("Senha alterada", "Sua senha foi alterada.", parent=self.master)
+        messagebox.showinfo("Senha alterada", "Sua senha foi alterada e todas as sessões ativas foram encerradas.\nFaça login novamente.", parent=pai)
+        if self.ao_alterar:
+            self.ao_alterar()
 
 
 class DialogoInteracao(Dialogo):
@@ -985,7 +989,7 @@ class AbaClientes(Aba):
         livre = not c["anonimizado"]
         self.btn_editar.state(["!disabled"] if livre and self.srv.pode("clientes.editar") else ["disabled"])
         self.btn_anon.state(["!disabled"] if livre and self.srv.pode("clientes.anonimizar") else ["disabled"])
-        self.btn_nota.state(["!disabled"] if self.srv.pode("clientes.anotar") else ["disabled"])
+        self.btn_nota.state(["!disabled"] if livre and self.srv.pode("clientes.anotar") else ["disabled"])
         self.btn_contato.state(["!disabled"] if livre and self.srv.pode("clientes.editar") else ["disabled"])
 
     def novo(self) -> None:
@@ -1111,14 +1115,14 @@ class AbaAuditoria(Aba):
         self.tree.tag_configure("quebra", foreground=COR["ruim"], background=COR["ruim_suave"])
 
     def atualizar(self) -> None:
-        pode = self.srv.pode("auditoria.verificar")
-        for b in (self.btn_verificar, self.btn_simular):
-            b.state(["!disabled"] if pode else ["disabled"])
-        self.btn_desfazer.state(["!disabled"] if pode and seguranca.adulteracao_ativa(self.srv.con) else ["disabled"])
-        if pode and seguranca.adulteracao_ativa(self.srv.con):
-            self.btn_simular.state(["disabled"])
+        pode_verif = self.srv.pode("auditoria.verificar")
+        pode_sim = self.srv.pode("auditoria.simular")
+        adulterado = seguranca.adulteracao_ativa(self.srv.con)
+        self.btn_verificar.state(["!disabled"] if pode_verif else ["disabled"])
+        self.btn_simular.state(["!disabled"] if pode_sim and not adulterado else ["disabled"])
+        self.btn_desfazer.state(["!disabled"] if pode_sim and adulterado else ["disabled"])
         quebra = None
-        if pode:
+        if pode_verif:
             ok, quebra, total = self.srv.verificar_auditoria()
             if ok:
                 self.banner.configure(style="BannerOk.TLabel", text=f"Cadeia íntegra: {total} registros verificados.")
@@ -1191,7 +1195,7 @@ class AbaAdmin(Aba):
             avisar(self, str(e))
             return
         self.app.atualizar_tudo()
-        self.lbl_teste.configure(text=f"Backup {caminho.name} criado em {caminho.parent}. Teste a restauração para confirmar que ele é confiável.",
+        self.lbl_teste.configure(text=f"Backup {caminho.name} criado com sucesso. Teste a restauração para confirmar que ele é confiável.",
                                  foreground=COR["tinta"])
 
     def _testar(self) -> None:
@@ -1365,8 +1369,10 @@ class JanelaAppCliente(tk.Toplevel):
         self.cliques += 1
         segundos = max(1, round(time.time() - (self.t0 or time.time())))
         try:
-            _, ticket = self.srv.registrar_feedback(self.ctx["id"], self.nota, self.etiquetas, self.comentario, self.cliques, segundos)
-        except ErroValidacao as e:
+            _, ticket = self.srv.registrar_feedback(
+                self.ctx["id"], self.nota, self.etiquetas, self.comentario,
+                self.cliques, segundos, cliente_id=self.ctx["cliente_id"])
+        except (ErroValidacao, seguranca.PermissaoNegada) as e:
             self.cliques -= 1
             avisar(self, str(e))
             return
@@ -1377,7 +1383,11 @@ class JanelaAppCliente(tk.Toplevel):
         self._desenhar()
 
     def falar_com_a_gente(self) -> None:
-        self.srv.solicitar_contato(self.ticket_id)
+        try:
+            self.srv.solicitar_contato(self.ticket_id, cliente_id=self.ctx["cliente_id"] if self.ctx else None)
+        except (ErroValidacao, seguranca.PermissaoNegada) as e:
+            avisar(self, str(e))
+            return
         self.contato = True
         self.app.atualizar_tudo()
         self._desenhar()
@@ -1530,7 +1540,7 @@ class TelaLogin(ttk.Frame):
         e2.pack(fill="x", pady=(2, 8))
         ttk.Label(centro, textvariable=self.erro, style="Erro.TLabel", background=COR["superficie"], wraplength=270, justify="left").pack(anchor="w")
         ttk.Button(centro, text="Entrar", style="Primario.TButton", command=self.entrar).pack(fill="x", pady=(10, 14))
-        ttk.Label(centro, text="Demonstração: logins atendente, gestor, logistica, producao,\nauditor e admin. Senha: " + "camc-demo-2026",
+        ttk.Label(centro, text="Use seu login e senha corporativos para acessar o sistema.",
                   style="CartaoSuave.TLabel", font=FONTE["pequena"], justify="left").pack(anchor="w")
         e1.focus_set()
         for e in (e1, e2):
@@ -1562,11 +1572,11 @@ class AppPrincipal(ttk.Frame):
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=14, pady=(10, 14))
         self.abas = {}
-        definicoes = [("painel", "Painel", sessao.pode("painel.ver"), AbaPainel), ("tickets", "Tickets", sessao.pode("tickets.ver"), AbaTickets),
-                      ("clientes", "Clientes", sessao.pode("clientes.ver"), AbaClientes),
-                      ("rastreio", "Rastreabilidade", sessao.pode("rastreio.ver"), AbaRastreio),
-                      ("auditoria", "Auditoria", sessao.pode("auditoria.ver"), AbaAuditoria),
-                      ("admin", "Administração", sessao.pode("backup.executar") or sessao.pode("usuarios.gerir"), AbaAdmin)]
+        definicoes = [("painel", "Painel", self.srv.pode("painel.ver"), AbaPainel), ("tickets", "Tickets", self.srv.pode("tickets.ver"), AbaTickets),
+                      ("clientes", "Clientes", self.srv.pode("clientes.ver"), AbaClientes),
+                      ("rastreio", "Rastreabilidade", self.srv.pode("rastreio.ver"), AbaRastreio),
+                      ("auditoria", "Auditoria", self.srv.pode("auditoria.ver"), AbaAuditoria),
+                      ("admin", "Administração", self.srv.pode("backup.executar") or self.srv.pode("usuarios.gerir"), AbaAdmin)]
         for chave, titulo, permitido, classe in definicoes:
             if permitido:
                 aba = classe(self.nb, self)
@@ -1579,8 +1589,8 @@ class AppPrincipal(ttk.Frame):
         barra = tk.Menu(self.root)
         arquivo = tk.Menu(barra, tearoff=0)
         arquivo.add_command(label="Abrir app do cliente (simulação)", command=self.abrir_app_cliente,
-                            state="normal" if self.sessao.pode("feedback.simular") else "disabled")
-        arquivo.add_command(label="Trocar minha senha…", command=lambda: DialogoSenha(self, self.srv))
+                            state="normal" if self.srv.pode("feedback.simular") else "disabled")
+        arquivo.add_command(label="Trocar minha senha…", command=lambda: DialogoSenha(self, self.srv, ao_alterar=self.sair))
         arquivo.add_separator()
         arquivo.add_command(label="Sair da sessão", command=self.sair)
         barra.add_cascade(label="Arquivo", menu=arquivo)
@@ -1590,7 +1600,7 @@ class AppPrincipal(ttk.Frame):
             "Dados de exemplo fictícios.", parent=self.root))
         barra.add_cascade(label="Ajuda", menu=ajuda)
         self.root.configure(menu=barra)
-        if self.sessao.pode("feedback.simular"):
+        if self.srv.pode("feedback.simular"):
             # atalho visível: o app do cliente é parte central da demonstração
             self.bind_all("<Control-Shift-A>", lambda e: self.abrir_app_cliente())
 
@@ -1610,6 +1620,7 @@ class AppPrincipal(ttk.Frame):
         self.janela_cliente = JanelaAppCliente(self)
 
     def sair(self) -> None:
+        seguranca.revogar_sessao(self.con, self.sessao)
         self.destruir()
         self.ao_sair()
 
@@ -1628,8 +1639,21 @@ class Aplicacao:
         self.root.title("CAMC – Sistema integrado")
         aplicar_tema(self.root)
         self.atual = None
+        self.root.report_callback_exception = self._tratar_erro_ui
         self.root.protocol("WM_DELETE_WINDOW", self.fechar)
         self.mostrar_login()
+
+    def _tratar_erro_ui(self, exc_type, exc_value, _exc_tb) -> None:
+        """Evita exposição de stack traces ou erros crus do banco na interface."""
+        if isinstance(exc_value, seguranca.SessaoInvalida):
+            avisar(self.root, str(exc_value), titulo="Sessão encerrada")
+            if isinstance(self.atual, AppPrincipal):
+                self.atual.sair()
+            return
+        if isinstance(exc_value, (ErroValidacao, seguranca.PermissaoNegada, seguranca.ErroAutenticacao)):
+            avisar(self.root, str(exc_value))
+            return
+        messagebox.showerror("Erro", "Ocorreu um erro interno ao processar a operação.", parent=self.root)
 
     def _geometria(self, largura: int, altura: int, minimo=None) -> None:
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -1650,6 +1674,8 @@ class Aplicacao:
 
     def fechar(self) -> None:
         try:
+            if isinstance(self.atual, AppPrincipal):
+                seguranca.revogar_sessao(self.con, self.atual.sessao)
             self.con.close()
         finally:
             self.root.destroy()
@@ -1661,7 +1687,7 @@ class Aplicacao:
 def main() -> None:
     con = banco.conectar()
     banco.inicializar(con)
-    if banco.banco_vazio(con):
+    if banco.banco_vazio(con) and os.environ.get("CAMC_AMBIENTE", "").strip().lower() != "producao":
         from . import exemplo
         exemplo.popular(con)
     Aplicacao(con).executar()

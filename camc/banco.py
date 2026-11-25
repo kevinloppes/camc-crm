@@ -25,13 +25,44 @@ def agora() -> str:
     return datetime.now().replace(microsecond=0).isoformat(sep=" ")
 
 
+def restringir_permissoes(caminho: Path, eh_diretorio: bool = False) -> None:
+    """Restringe permissões de arquivos/diretórios em sistemas POSIX (0700/0600)."""
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(caminho, 0o700 if eh_diretorio else 0o600)
+    except OSError:
+        pass
+
+
+def normalizar_email(texto: str) -> str:
+    """Normaliza e-mails para detecção de unicidade (lowercase, remoção de +tag e pontos no Gmail)."""
+    email = (texto or "").strip().lower()
+    if "@" not in email:
+        return ""
+    local, dominio = email.rsplit("@", 1)
+    if not local or not dominio:
+        return ""
+    local = local.split("+", 1)[0]
+    if dominio == "googlemail.com":
+        dominio = "gmail.com"
+    if dominio == "gmail.com":
+        local = local.replace(".", "")
+    if not local:
+        return ""
+    return f"{local}@{dominio}"
+
+
 def conectar(caminho=None) -> sqlite3.Connection:
     """Abre uma conexão (criando a pasta e o arquivo, se necessário)."""
     destino = Path(caminho) if caminho else caminho_banco()
     destino.parent.mkdir(parents=True, exist_ok=True)
+    restringir_permissoes(destino.parent, eh_diretorio=True)
     con = sqlite3.connect(str(destino))
+    restringir_permissoes(destino, eh_diretorio=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA secure_delete = ON")
     return con
 
 
@@ -58,22 +89,41 @@ CREATE TABLE IF NOT EXISTS usuarios (
     iteracoes     INTEGER NOT NULL,
     ativo         INTEGER NOT NULL DEFAULT 1,
     tentativas    INTEGER NOT NULL DEFAULT 0,
+    bloqueado_ate TEXT,
+    token_versao  INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS sessoes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    usuario_id   INTEGER NOT NULL REFERENCES usuarios(id),
+    token_hash   TEXT NOT NULL UNIQUE,
+    refresh_hash TEXT NOT NULL UNIQUE,
+    criada_em    TEXT NOT NULL,
+    expira_em    TEXT NOT NULL,
+    revogada_em  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS login_rate_limit (
+    chave         TEXT PRIMARY KEY,
+    tentativas    INTEGER NOT NULL DEFAULT 0,
+    janela_inicio TEXT NOT NULL,
     bloqueado_ate TEXT
 );
 
 CREATE TABLE IF NOT EXISTS clientes (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    nome            TEXT NOT NULL,
-    tipo            TEXT NOT NULL CHECK (tipo IN ('PF', 'PJ')),
-    documento       TEXT NOT NULL DEFAULT '',
-    telefone        TEXT NOT NULL DEFAULT '',
-    email           TEXT NOT NULL DEFAULT '',
-    cidade          TEXT NOT NULL DEFAULT '',
-    canal_preferido TEXT NOT NULL,
-    segmento        TEXT NOT NULL,
-    consentimento_em TEXT,
-    anonimizado     INTEGER NOT NULL DEFAULT 0,
-    criado_em       TEXT NOT NULL
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome              TEXT NOT NULL,
+    tipo              TEXT NOT NULL CHECK (tipo IN ('PF', 'PJ')),
+    documento         TEXT NOT NULL DEFAULT '',
+    telefone          TEXT NOT NULL DEFAULT '',
+    email             TEXT NOT NULL DEFAULT '',
+    email_normalizado TEXT NOT NULL DEFAULT '',
+    cidade            TEXT NOT NULL DEFAULT '',
+    canal_preferido   TEXT NOT NULL,
+    segmento          TEXT NOT NULL,
+    consentimento_em  TEXT,
+    anonimizado       INTEGER NOT NULL DEFAULT 0,
+    criado_em         TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS anotacoes (
@@ -204,8 +254,29 @@ CREATE TABLE IF NOT EXISTS config (
 
 
 def inicializar(con: sqlite3.Connection) -> None:
-    """Cria as tabelas e os gatilhos de proteção, se ainda não existirem."""
+    """Cria as tabelas, índices de unicidade e gatilhos de proteção, se ainda não existirem."""
     con.executescript(ESQUEMA)
+    # Migrações seguras para bancos já existentes
+    cols_usuarios = {r["name"] for r in con.execute("PRAGMA table_info(usuarios)")}
+    if "token_versao" not in cols_usuarios:
+        con.execute("ALTER TABLE usuarios ADD COLUMN token_versao INTEGER NOT NULL DEFAULT 1")
+    cols_clientes = {r["name"] for r in con.execute("PRAGMA table_info(clientes)")}
+    if "email_normalizado" not in cols_clientes:
+        con.execute("ALTER TABLE clientes ADD COLUMN email_normalizado TEXT NOT NULL DEFAULT ''")
+    for c in con.execute("SELECT id, email FROM clientes WHERE anonimizado = 0 AND email != '' AND email_normalizado = ''").fetchall():
+        con.execute("UPDATE clientes SET email_normalizado = ? WHERE id = ?", (normalizar_email(c["email"]), c["id"]))
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_clientes_email_norm "
+        "ON clientes(email_normalizado) WHERE anonimizado = 0 AND email_normalizado != ''"
+    )
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_clientes_documento "
+        "ON clientes(documento) WHERE anonimizado = 0 AND documento != ''"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessoes_usuario_ativa "
+        "ON sessoes(usuario_id) WHERE revogada_em IS NULL"
+    )
     con.execute(GATILHO_SEM_UPDATE)
     con.execute(GATILHO_SEM_DELETE)
     con.commit()

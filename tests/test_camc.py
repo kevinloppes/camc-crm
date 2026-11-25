@@ -1,9 +1,12 @@
 """Testes automatizados: python -m unittest discover -s tests -v"""
+import hashlib
+import io
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -68,14 +71,63 @@ class TestSeguranca(Base):
         self.assertIsNone(seguranca.validar_forca_senha("senha-forte-2026"))
 
     def test_login_e_bloqueio(self):
-        with self.assertRaises(seguranca.ErroAutenticacao):
+        with self.assertRaises(seguranca.ErroAutenticacao) as ctx_err:
             seguranca.autenticar(self.con, "atendente", "errada")
+        with self.assertRaises(seguranca.ErroAutenticacao) as ctx_inex:
+            seguranca.autenticar(self.con, "usuario_inexistente", "errada")
+        self.assertEqual(str(ctx_err.exception), str(ctx_inex.exception))
         for _ in range(seguranca.MAX_TENTATIVAS):
             with self.assertRaises(seguranca.ErroAutenticacao):
                 seguranca.autenticar(self.con, "gestor", "errada")
         with self.assertRaises(seguranca.ErroAutenticacao) as ctx:
             seguranca.autenticar(self.con, "gestor", SENHA)
-        self.assertIn("bloqueada", str(ctx.exception))
+        # Mensagem deve permanecer genérica (anti-enumeração), mantendo o bloqueio efetivo no servidor
+        self.assertEqual(str(ctx.exception), seguranca.ERRO_LOGIN_GENERICO)
+        row = self.con.execute("SELECT bloqueado_ate FROM usuarios WHERE login = 'gestor'").fetchone()
+        self.assertIsNotNone(row["bloqueado_ate"])
+
+    def test_rate_limit_login_inexistente(self):
+        for _ in range(seguranca.MAX_TENTATIVAS):
+            with self.assertRaises(seguranca.ErroAutenticacao) as ctx:
+                seguranca.autenticar(self.con, "fantasma", "qualquer")
+            self.assertEqual(str(ctx.exception), seguranca.ERRO_LOGIN_GENERICO)
+        rl = self.con.execute("SELECT bloqueado_ate FROM login_rate_limit WHERE chave = 'login:fantasma'").fetchone()
+        self.assertIsNotNone(rl)
+        self.assertIsNotNone(rl["bloqueado_ate"])
+
+    def test_bloqueio_senhas_vazadas_e_hibp_k_anonymity(self):
+        # Senha demo conhecida bloqueada localmente mesmo offline
+        self.assertIsNotNone(seguranca.validar_forca_senha(SENHA))
+        # Apenas 2 classes (minúsculas + números) deve ser rejeitada
+        self.assertIsNotNone(seguranca.validar_forca_senha("abcdefghijkl1", verificar_vazamento=False))
+        # Simula resposta HIBP k-anonymity (apenas prefixo de 5 chars enviado)
+        candidata = "MinhaSenhaTeste#2026"
+        sha1 = hashlib.sha1(candidata.encode("utf-8")).hexdigest().upper()
+        prefixo, sufixo = sha1[:5], sha1[5:]
+
+        class FakeResp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.close()
+
+        capturado = {}
+
+        def fake_urlopen(req, timeout=3.0):
+            capturado["url"] = req.full_url
+            capturado["padding"] = req.get_header("Add-padding")
+            return FakeResp(f"{sufixo}:42\n00000000000000000000000000000000000:0\n".encode("utf-8"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self.assertTrue(seguranca.verificar_senha_vazada(candidata, modo="best_effort"))
+            self.assertTrue(capturado["url"].endswith(f"/range/{prefixo}"))
+            self.assertEqual(capturado["padding"], "true")
+            self.assertIsNotNone(seguranca.validar_forca_senha(candidata))
+
+        # Entrada com contagem 0 (padding HIBP) não deve bloquear
+        with mock.patch("urllib.request.urlopen", return_value=FakeResp(f"{sufixo}:0\n".encode("utf-8"))):
+            self.assertFalse(seguranca.verificar_senha_vazada(candidata, modo="best_effort"))
 
     def test_perfis(self):
         self.assertTrue(seguranca.tem_permissao("gestor", "auditoria.verificar"))
@@ -107,10 +159,15 @@ class TestSeguranca(Base):
         rel = admin.testar_backup(caminho)
         self.assertTrue(rel["aprovado"], rel)
         self.assertGreater(rel["clientes"], 0)
-        # corrompe o backup: o teste precisa reprovar
+        # corrompe o backup: o teste precisa reprovar sem expor erro interno bruto
         with open(caminho, "ab") as f:
             f.write(b"lixo")
         self.assertFalse(admin.testar_backup(caminho)["aprovado"])
+        # bloqueia path traversal fora da pasta de backups
+        fora = self.pasta / "fora.db"
+        fora.write_bytes(b"nao-e-backup")
+        with self.assertRaises(ErroValidacao):
+            admin.testar_backup(fora)
 
     def test_retencao_de_backups(self):
         for _ in range(4):
@@ -149,6 +206,19 @@ class TestClientes(Base):
             s.criar_cliente(self.dados_cliente(telefone="12 99100 0003"), True)
         with self.assertRaises(ClienteDuplicado):
             s.criar_cliente(self.dados_cliente(email="PAULO.N@email.example"), True)
+        # normalização contra aliases (+tag, pontos no Gmail e googlemail.com)
+        with self.assertRaises(ClienteDuplicado):
+            s.criar_cliente(self.dados_cliente(email="paulo.n+promo@email.example"), True)
+        cid_gmail = s.criar_cliente(
+            self.dados_cliente(documento="70548445052", telefone="(12) 97777-1111", email="joao.silva@gmail.com"),
+            True,
+        )
+        self.assertGreater(cid_gmail, 0)
+        with self.assertRaises(ClienteDuplicado):
+            s.criar_cliente(
+                self.dados_cliente(documento="34791032004", telefone="(12) 97777-2222", email="joaosilva+trial@googlemail.com"),
+                True,
+            )
 
     def test_permissoes_de_clientes(self):
         with self.assertRaises(seguranca.PermissaoNegada):
@@ -165,9 +235,18 @@ class TestClientes(Base):
         self.assertEqual((c["documento"], c["telefone"], c["email"]), ("", "", ""))
         self.assertEqual(c["anonimizado"], 1)
         self.assertEqual(len(g.anotacoes(2)), 0)
+        self.assertEqual(self.con.execute("SELECT COUNT(*) FROM interacoes WHERE cliente_id = 2").fetchone()[0], 0)
+        autores = [r["autor"] for r in self.con.execute(
+            "SELECT autor FROM ticket_eventos WHERE tipo = 'cliente' AND ticket_id IN (SELECT id FROM tickets WHERE cliente_id = 2)"
+        ).fetchall()]
+        self.assertTrue(all(a == "Cliente anonimizado #2" for a in autores))
+        ultimo_audit = self.con.execute("SELECT detalhe FROM auditoria ORDER BY n DESC LIMIT 1").fetchone()["detalhe"]
+        self.assertNotIn("Restaurante Raízes", ultimo_audit)
         self.assertGreater(len(g.pedidos_do_cliente(2)), 0)  # histórico permanece
         with self.assertRaises(ErroValidacao):
             self.como("atendente").editar_cliente(2, self.dados_cliente())
+        with self.assertRaises(ErroValidacao):
+            self.como("atendente").registrar_interacao(2, "WhatsApp", "Tentativa após anonimização")
 
     def test_linha_do_tempo_unifica_canais(self):
         tl = self.como("atendente").linha_do_tempo(1)
@@ -290,10 +369,62 @@ class TestAdmin(Base):
         with self.assertRaises(seguranca.ErroAutenticacao):
             seguranca.autenticar(self.con, "atendente", SENHA)
         a = self.como("gestor")
+        sessao_secundaria = seguranca.autenticar(self.con, "gestor", SENHA)
+        outro_srv = ServicoCRM(self.con, sessao_secundaria)
+        refresh_antigo = sessao_secundaria.refresh_token
         with self.assertRaises(ErroValidacao):
             a.alterar_minha_senha(SENHA, "curta")
         a.alterar_minha_senha(SENHA, "nova-senha-2026!")
-        seguranca.autenticar(self.con, "gestor", "nova-senha-2026!")
+        # Todas as sessões e refresh tokens anteriores devem estar imediatamente revogados
+        with self.assertRaises(seguranca.SessaoInvalida):
+            a.listar_tickets()
+        with self.assertRaises(seguranca.SessaoInvalida):
+            outro_srv.listar_tickets()
+        with self.assertRaises(seguranca.SessaoInvalida):
+            seguranca.renovar_sessao(self.con, refresh_antigo)
+        nova_sessao = seguranca.autenticar(self.con, "gestor", "nova-senha-2026!")
+        self.assertTrue(seguranca.sessao_valida(self.con, nova_sessao))
+
+    def test_protecao_rotas_idor_e_revogacao_por_desativacao(self):
+        # Sem sessão não acessa métodos internos de negócio
+        anon = ServicoCRM(self.con, None)
+        with self.assertRaises(seguranca.PermissaoNegada):
+            anon.obter_cliente(1)
+        with self.assertRaises(seguranca.PermissaoNegada):
+            anon.pedidos_aguardando_avaliacao()
+        with self.assertRaises(seguranca.PermissaoNegada):
+            anon.criar_ticket(1, "WhatsApp", "Dúvida", "baixa", "Bypass", automatico=True)
+
+        # Admin de TI não vê dados de negócio mesmo chamando métodos diretos
+        admin = self.como("admin")
+        with self.assertRaises(seguranca.PermissaoNegada):
+            admin.obter_cliente(1)
+        with self.assertRaises(seguranca.PermissaoNegada):
+            admin.nos_do_pedido(1041)
+        with self.assertRaises(seguranca.PermissaoNegada):
+            admin.contexto_pedido(1041)
+
+        # Auditor (somente leitura) não pode adulterar auditoria nem burlar criar_ticket
+        auditor = self.como("auditor")
+        with self.assertRaises(seguranca.PermissaoNegada):
+            auditor.simular_adulteracao()
+        with self.assertRaises(seguranca.PermissaoNegada):
+            auditor.criar_ticket(1, "WhatsApp", "Dúvida", "baixa", "Bypass", automatico=True)
+
+        # IDOR: feedback e solicitação de contato validam titularidade e origem
+        atendente = self.como("atendente")
+        with self.assertRaises(seguranca.PermissaoNegada):
+            atendente.registrar_feedback(1041, 5, cliente_id=999)
+        with self.assertRaises(seguranca.PermissaoNegada):
+            atendente.solicitar_contato(233)  # ticket do WhatsApp sem pedido
+
+        # Desativar usuário revoga imediatamente sessões ativas existentes
+        uid = self.con.execute("SELECT id FROM usuarios WHERE login='logistica'").fetchone()["id"]
+        logistica_ativo = self.como("logistica")
+        self.assertGreater(len(logistica_ativo.listar_tickets()), 0)
+        admin.alternar_usuario(uid)
+        with self.assertRaises(seguranca.SessaoInvalida):
+            logistica_ativo.listar_tickets()
 
 
 if __name__ == "__main__":

@@ -1,12 +1,15 @@
 """Dados de exemplo (fictícios) para demonstrar o sistema na primeira execução."""
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timedelta
 
-from . import seguranca
+from . import banco, seguranca
 
-SENHA_DEMO = "camc-demo-2026"
+# Senha exclusiva para demonstração/testes locais; pode ser sobrescrita via CAMC_SENHA_DEMO.
+# Em produção (CAMC_AMBIENTE=producao), o seed automático de usuários de demonstração é bloqueado.
+SENHA_DEMO = os.environ.get("CAMC_SENHA_DEMO", "camc-demo-2026")
 
 USUARIOS = [
     ("atendente", "Ana Souza", "atendente"),
@@ -18,7 +21,11 @@ USUARIOS = [
 ]
 
 
-def popular(con: sqlite3.Connection, iteracoes: int = seguranca.ITERACOES) -> None:
+def popular(con: sqlite3.Connection, iteracoes: int = seguranca.ITERACOES,
+            senha_inicial: str | None = None) -> None:
+    if os.environ.get("CAMC_AMBIENTE", "").strip().lower() == "producao" and not senha_inicial:
+        raise RuntimeError("Não é permitido popular contas de demonstração em ambiente de produção.")
+    senha_seed = senha_inicial or SENHA_DEMO
     agora = datetime.now().replace(microsecond=0)
 
     def atras(horas: float) -> str:
@@ -29,7 +36,7 @@ def popular(con: sqlite3.Connection, iteracoes: int = seguranca.ITERACOES) -> No
 
     # usuários
     for login, nome, perfil in USUARIOS:
-        h, sal, it = seguranca.hash_senha(SENHA_DEMO, iteracoes=iteracoes)
+        h, sal, it = seguranca.hash_senha(senha_seed, iteracoes=iteracoes)
         con.execute("INSERT INTO usuarios (login, nome, perfil, senha_hash, salt, iteracoes) VALUES (?,?,?,?,?,?)",
                     (login, nome, perfil, h, sal, it))
 
@@ -51,8 +58,12 @@ def popular(con: sqlite3.Connection, iteracoes: int = seguranca.ITERACOES) -> No
     ]
     for c in clientes:
         quando = atras(24 * c[9])
-        con.execute("INSERT INTO clientes (id, nome, tipo, documento, telefone, email, cidade, canal_preferido, segmento, consentimento_em, criado_em)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)", (*c[:9], quando, quando))
+        email_norm = banco.normalizar_email(c[5])
+        con.execute(
+            "INSERT INTO clientes (id, nome, tipo, documento, telefone, email, email_normalizado, cidade,"
+            " canal_preferido, segmento, consentimento_em, criado_em) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (c[0], c[1], c[2], c[3], c[4], c[5], email_norm, c[6], c[7], c[8], quando, quando),
+        )
     con.execute("INSERT INTO anotacoes (cliente_id, autor, texto, criado_em) VALUES (2, 'Ana Souza', ?, ?)",
                 ("Compra chia todo mês; prefere nota fiscal por e-mail.", atras(24 * 20)))
 
